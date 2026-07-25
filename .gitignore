@@ -1,0 +1,7 @@
+build/
+game/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.1)
+cmake_policy(SET CMP0144 NEW)
+cmake_policy(SET CMP0167 NEW)
 project(pvz2native)
 
 include_directories(${PROJECT_SOURCE_DIR}/stb)
