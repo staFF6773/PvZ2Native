@@ -127,8 +127,32 @@ make pvz2native      # with the MinGW make
 
 ### Linux
 The quick way is [compile.sh](compile.sh):
+
 ```bash
 ./compile.sh
+```
+
+`compile.sh` checks for the required tools (`cmake`, a C++ compiler, `make`/`ninja`, `unzip`), configures a Release build, compiles the project and copies or extracts the game assets from `game/` when they are present. By default full build output is saved to `build/compile.log` and a short summary is printed at the end.
+
+Useful options:
+
+| Option | Description |
+| --- | --- |
+| `-c, --clean` | Delete `build/` before configuring |
+| `-d, --debug` | Configure a Debug build |
+| `-r, --release` | Configure a Release build (default) |
+| `-j, --jobs N` | Compile with `N` parallel jobs |
+| `-n, --no-assets` | Skip copying/extracting game assets |
+| `-v, --verbose` | Print CMake/build output to the terminal |
+| `-h, --help` | Show all options |
+
+Examples:
+
+```bash
+./compile.sh                  # standard Release build
+./compile.sh --debug --clean  # clean Debug build
+./compile.sh --jobs 4         # Release build with 4 parallel jobs
+./compile.sh --no-assets      # build only, do not touch game files
 ```
 
 Or by hand:
