@@ -244,6 +244,12 @@ void audio_pump_callbacks();
  * mid-call would clobber the call in progress. */
 std::uint32_t call_guest_between_frames(std::uint32_t fn, std::uint32_t a0, std::uint32_t a1);
 
+/* Same, for a callback taking more than two arguments, laid out AAPCS-style
+ * (r0-r3 then the stack). The caller owns the layout -- a jlong takes an even/odd
+ * register pair. Used by the emulated purchase driver to invoke the engine's
+ * FirePaymentComplete / FireDidRefresh natives between frames. */
+std::uint32_t call_guest_between_frames_n(std::uint32_t fn, const std::uint32_t *args, int nargs);
+
 /* Fills in the imported STT_OBJECT symbols (ctype tables, stack canary, stdio
  * handles) that the loader gave real guest memory, and registers the three
  * __sF streams as file tokens. Call once after load, before any guest code. */

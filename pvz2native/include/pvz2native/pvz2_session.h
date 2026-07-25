@@ -44,6 +44,13 @@ int pvz2_session_frame(pvz2_session_t *session);
  * the engine's coordinate space. Safe to call before pvz2_session_start. */
 void pvz2_render_size(int *width, int *height);
 
+/* Sets the resolution the engine will launch at, BEFORE pvz2_session_start. The
+ * host resolves it from the [video] config (auto-aspect, native, or explicit)
+ * and calls this so the guest surface, the window and the touch space all start
+ * from the same size. A later window resize goes through
+ * pvz2_session_request_resize instead. */
+void pvz2_set_render_size(int width, int height);
+
 /* Tell the compositor the current window drawable size, so the final pass fills
  * the window instead of the engine's render size. Call once the window exists
  * and again whenever it is resized. */

@@ -96,6 +96,39 @@ struct GameSymbols {
         std::uint32_t http_transaction_error;
     } jni_native;
 
+    /* Instructions the port rewrites in the loaded image -- see game/patches.h,
+     * which explains why one exists at all. Addresses only; the rewriting and
+     * its verification live there. */
+    struct {
+        /* Every call to the engine's "is the device online?" helper made from
+         * INSIDE the purchase broker, as offsets into the .so. Each is a 4-byte
+         * ARM `BL` that is rewritten to `MOV R0, #1`, which is what makes an
+         * emulated store usable on a port with no network. 0 ends the list, and
+         * an all-zero list simply patches nothing. */
+        std::uint32_t purchase_online_gate[8];
+
+        /* The receipt verdict, which takes two instructions because the engine
+         * only ever reaches a "purchase finished" state through its validation
+         * server. Both are `MOV Rd, #imm` and 0 means not mapped.
+         *
+         * A completed payment is put on the broker's pending list, and the broker
+         * hands the item over only once that record reads (finished, validated).
+         * Only the server sets validated: the HTTP reply's "$.validation" must
+         * say "passed". This port has no network, so left alone the purchase
+         * hangs on "Purchasing Stuff..." forever waiting for that reply.
+         *
+         *   local_receipt  -- the `MOV R1, #1` in the thunk whose only caller is
+         *                     OnPaymentComplete, meaning "POST the receipt and
+         *                     wait". Rewritten to `MOV R1, #0`: finish now.
+         *   receipt_verdict-- the `MOV R0, #0` in that finish-now branch, which
+         *                     writes "not validated". Rewritten to `MOV R0, #1`.
+         * Together they are exactly the outcome of a server answering "passed",
+         * without the round trip. Patching only the first ends at the engine's
+         * "Unable to contact store" dialog, which is that branch being honest. */
+        std::uint32_t purchase_local_receipt;
+        std::uint32_t purchase_receipt_verdict;
+    } patch;
+
     /* Field offsets for the touch diagnostic -- see diagnostics/input_probe.
      * All optional: zeroed out, the probe simply reports nothing. */
     struct {

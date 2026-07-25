@@ -33,6 +33,10 @@ std::atomic<pvz2_host_pump_fn> g_host_pump{nullptr};
 std::mutex g_status_lock;
 char g_status[160] = "starting";
 
+/* The guest surface size, chosen at startup -- see set_window_size. */
+std::uint32_t g_window_w = 960;
+std::uint32_t g_window_h = 540;
+
 /* Memory watchpoint state -- see watch_arm. */
 std::uint32_t g_watch_lo = 0;
 std::uint32_t g_watch_hi = 0;
@@ -88,6 +92,24 @@ Dynarmic::A32::UserConfig make_arm_user_config(GuestRuntime *rt, Pvz2Env *env,
     /* Inline guest memory accesses -- see build_page_table(). Null (the config
      * opt-out) simply leaves every access on the callback path. */
     config.page_table = g_page_table.get();
+
+    /* All of dynarmic's SAFE optimizations: block linking, the return-stack
+     * buffer, the fast dispatcher, and the IR passes. It is already the library
+     * default, but stating it here makes it a decision rather than an accident,
+     * and it is the biggest lever this build has for a weak host CPU -- every one
+     * cuts either dispatcher lookups or emitted instructions. Unsafe opts (which
+     * trade FP accuracy for speed) are deliberately NOT enabled: they are off by
+     * default in dynarmic for a reason and a plants-vs-zombies frame is not worth
+     * a wrong NaN. */
+    config.optimizations = Dynarmic::all_safe_optimizations;
+
+    /* The engine derives all its timing from the wall clock (gettimeofday), never
+     * from the ARM generic timer, so tell the translator a wall clock backs
+     * CNTPCT. That lets it skip the extra code it would otherwise emit around
+     * cycle-timer reads -- a free reduction in generated code with no behavioural
+     * change here. */
+    config.wall_clock_cntpct = true;
+
     return config;
 }
 
@@ -100,6 +122,13 @@ void set_slice_override(std::uint32_t ticks) {
 }
 
 void set_host_pump(pvz2_host_pump_fn fn) { g_host_pump.store(fn, std::memory_order_relaxed); }
+
+std::uint32_t window_width() { return g_window_w; }
+std::uint32_t window_height() { return g_window_h; }
+void set_window_size(std::uint32_t w, std::uint32_t h) {
+    if (w > 0) g_window_w = w;
+    if (h > 0) g_window_h = h;
+}
 
 void set_status(const char *fmt, ...) {
     char buf[160];
@@ -462,20 +491,51 @@ void Pvz2Env::ExceptionRaised(std::uint32_t pc, Dynarmic::A32::Exception excepti
 
 void Pvz2Env::AddTicks(std::uint64_t ticks) {
     ticks_used += ticks;
-    if (ticks_used >= kTickBudget) {
-        {
+    if (ticks_used < kTickBudget) return;
+
+    /* The budget is a runaway-loop guard for the WINDOW thread only. If the main
+     * thread spins without yielding, the window stops pumping and the app hangs,
+     * so halting it is the right call. A spawned worker crossing the budget is a
+     * different story: Wwise's audio threads legitimately run billions of
+     * instructions over minutes, and halting one kills whatever it feeds (the
+     * audio semaphores) -- which is the real cause behind "audio dies / the game
+     * freezes after ~5 minutes". note_blocked already rescues a worker that
+     * blocks on a primitive; this is the backstop for one that computes straight
+     * through without blocking. So a worker is never halted here: its budget is
+     * reset (rearming the guard) and it keeps running. A true worker spinlock
+     * then merely pins a core instead of deadlocking the game -- the lesser evil,
+     * and far rarer than this false positive was. */
+    if (guest_tls::self_id != 1) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
             std::lock_guard<std::mutex> lg(rt->log_lock);
-            std::printf("pvz2: tick budget exhausted (%llu), halting\n",
-                        (unsigned long long)ticks_used);
+            std::printf("pvz2: [thread %u] crossed the %llu-tick mark -- long-lived worker, "
+                        "budget not enforced (normal for audio/streaming threads)\n",
+                        guest_tls::self_id, (unsigned long long)kTickBudget);
         }
-        should_halt = true;
-        jit->HaltExecution();
+        ticks_used = 0;
+        return;
     }
+
+    {
+        std::lock_guard<std::mutex> lg(rt->log_lock);
+        std::printf("pvz2: tick budget exhausted (%llu), halting\n",
+                    (unsigned long long)ticks_used);
+    }
+    should_halt = true;
+    jit->HaltExecution();
 }
 
 std::uint64_t Pvz2Env::GetTicksRemaining() {
-    if (ticks_used >= kTickBudget) return 0;
-    std::uint64_t remaining = kTickBudget - ticks_used;
+    /* Only the main thread is bounded by the budget (see AddTicks); a worker
+     * always gets a full slice, and its ticks_used is reset before it could ever
+     * reach kTickBudget, so it never falls into the "return 0" that would stop
+     * it dead. */
+    std::uint64_t remaining = kPcSampleSlice;
+    if (guest_tls::self_id == 1) {
+        if (ticks_used >= kTickBudget) return 0;
+        remaining = kTickBudget - ticks_used;
+    }
     if (std::uint32_t slice = g_slice_override.load(std::memory_order_relaxed)) {
         return std::min<std::uint64_t>(remaining, slice);
     }
@@ -866,8 +926,12 @@ void run_guest_call(pvz2_elf_image_t *img, GuestRuntime *rt, const char *label,
     if (chatty) {
         std::printf("pvz2: ---- running %s at 0x%08x (offset 0x%x) ----\n", label, entry_addr,
                     offset);
+        /* Only the non-per-frame calls (the boot phases) update the window-title
+         * status; a per-frame onDrawFrame doing it churned a mutex and a
+         * vsnprintf every frame for a string nothing shows once booted -- the
+         * title is FPS by then. */
+        set_status("%s", label);
     }
-    set_status("%s", label);
 
     GuestThreadCtx &ctx = main_ctx(img, rt);
     GuestCallSetup setup;
@@ -916,6 +980,23 @@ std::uint32_t call_guest_quiet(pvz2_elf_image_t *img, GuestRuntime *rt, std::uin
     return ctx.jit.Regs()[0];
 }
 
+std::uint32_t call_guest_quiet_args(pvz2_elf_image_t *img, GuestRuntime *rt, std::uint32_t offset,
+                                    const std::uint32_t *args, int nargs) {
+    GuestThreadCtx &ctx = main_ctx(img, rt);
+    GuestCallSetup setup;
+    if (nargs > 0) setup.r0 = args[0];
+    if (nargs > 1) setup.r1 = args[1];
+    if (nargs > 2) setup.r2 = args[2];
+    if (nargs > 3) setup.r3 = args[3];
+    for (int i = 4; i < nargs; ++i) setup.stack_args.push_back(args[i]);
+    setup.sp = kStackTop;
+    setup.lr = img->trampoline_base; /* LR -> "$halt" sentinel */
+    setup.entry_pc = img->so_base + offset;
+    apply_call_setup(ctx.jit, ctx.env, img, setup);
+    run_nested(ctx.jit, ctx.env);
+    return ctx.jit.Regs()[0];
+}
+
 }  // namespace runtime
 
 /* --- the two hooks src/dependencies/ reaches back through -------------------- */
@@ -942,6 +1023,13 @@ std::uint32_t call_guest_between_frames(std::uint32_t fn, std::uint32_t a0, std:
     GuestRuntime *rt = runtime::g_runtime;
     if (img == nullptr || rt == nullptr || fn < img->so_base) return 0;
     return runtime::call_guest_quiet(img, rt, fn - img->so_base, a0, a1);
+}
+
+std::uint32_t call_guest_between_frames_n(std::uint32_t fn, const std::uint32_t *args, int nargs) {
+    pvz2_elf_image_t *img = runtime::g_image;
+    GuestRuntime *rt = runtime::g_runtime;
+    if (img == nullptr || rt == nullptr || fn < img->so_base) return 0;
+    return runtime::call_guest_quiet_args(img, rt, fn - img->so_base, args, nargs);
 }
 
 }  // namespace pvz2native

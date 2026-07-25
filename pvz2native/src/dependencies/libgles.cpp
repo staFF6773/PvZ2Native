@@ -12,6 +12,7 @@
 
 #include <pvz2native/dependencies/dependency.h>
 #include <pvz2native/config.h>
+#include <pvz2native/gfx/gl_requirements.h>
 
 /* gles_compat.c is C; its symbols have C linkage. */
 extern "C" {
@@ -20,6 +21,7 @@ extern "C" {
 
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1106,19 +1108,58 @@ void gl_glShadeModel(GuestCall &c) {
             gl_shade_model(c.arg(0));
 }
 
+/* Removes every `precision <qualifier> <type>;` statement from a shader body.
+ * GLSL 1.30 accepts them as no-ops, but 1.20 (a 2.1 host) does not know the
+ * concept at all, so they have to go. Only a whole-word `precision` at a token
+ * boundary and followed by whitespace is treated as a statement, and it is
+ * erased up to and including its terminating ';' -- a precision statement never
+ * contains another semicolon, so this cannot swallow real code. */
+static void strip_precision_statements(std::string &src) {
+    std::size_t pos = 0;
+    while ((pos = src.find("precision", pos)) != std::string::npos) {
+        const std::size_t after = pos + 9; /* strlen("precision") */
+        const bool at_word_start =
+            pos == 0 || !(std::isalnum((unsigned char)src[pos - 1]) || src[pos - 1] == '_');
+        const bool followed_by_space =
+            after < src.size() && std::isspace((unsigned char)src[after]);
+        if (at_word_start && followed_by_space) {
+            const std::size_t semi = src.find(';', after);
+            if (semi == std::string::npos) break;
+            src.erase(pos, semi - pos + 1);
+        } else {
+            pos = after;
+        }
+    }
+}
+
+/* Rewrites GLSL ES 1.00 into what the detected host context accepts -- see
+ * pvz2_gl_target_glsl(). A shader that already declares its own #version is
+ * left untouched. */
+static void adapt_shader_source(std::string &src) {
+    if (src.find("#version") != std::string::npos) return;
+    if (pvz2_gl_target_glsl() == 120) {
+        /* 1.20 has no precision qualifiers: strip the statements and #define the
+         * inline lowp/mediump/highp away so the ES bodies compile unchanged. */
+        strip_precision_statements(src);
+        src.insert(0, "#version 120\n#define lowp\n#define mediump\n#define highp\n");
+    } else {
+        src.insert(0, "#version 130\n");
+    }
+}
+
 void gl_glShaderSource(GuestCall &c) {
-            /* The guest ships GLSL ES 1.00. Our context is desktop GL, whose
-             * compiler rejects the ES precision qualifiers outright:
+            /* The guest ships GLSL ES 1.00, which desktop GL rejects outright:
              *   "syntax error, unexpected identifier ... at token \"lowp\""
-             * Every shader failed, every program failed to link, and the
-             * engine -- which never reads the info log -- kept issuing draw
-             * calls against no valid program, i.e. a black screen.
+             * Every shader failed, every program failed to link, and the engine
+             * -- which never reads the info log -- kept issuing draw calls
+             * against no valid program, i.e. a black screen.
              *
-             * Desktop GLSL 1.30 accepts both `lowp/mediump/highp` and the
-             * `precision ...;` statement as no-ops precisely for ES
-             * compatibility, so prepending a #version directive is enough; no
-             * rewriting of the body is needed. Shaders that already declare
-             * their own #version are passed through untouched. */
+             * adapt_shader_source() rewrites it for whatever the host context
+             * actually is: a 3.0+ context just gets a "#version 130" prefix (1.30
+             * accepts the ES qualifiers as no-ops), a 2.1 one gets a "#version
+             * 120" prefix plus the precision-qualifier rewrite. Which of the two
+             * is chosen by pvz2_gl_target_glsl(), latched at startup, so this
+             * layer holds no version policy. */
             GLuint shader = c.arg(0);
             GLsizei count = (GLsizei)c.arg(1);
             uint32_t strings_ptr = c.arg(2);
@@ -1136,9 +1177,7 @@ void gl_glShaderSource(GuestCall &c) {
                 src.append(chunk);
             }
 
-            if (src.find("#version") == std::string::npos) {
-                src.insert(0, "#version 130\n");
-            }
+            adapt_shader_source(src);
 
             /* [gl] flat_fragment=1 replaces every fragment shader's body with a
              * constant magenta output, keeping its declarations so it still

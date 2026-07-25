@@ -31,6 +31,7 @@
  */
 
 #include <pvz2native/dex/dex.h>
+#include <pvz2native/config.h>
 #include <pvz2native/game/symbols.h>
 
 #include <map>
@@ -41,6 +42,7 @@ namespace dex {
 namespace {
 
 constexpr const char *kClass = "com/popcap/SexyAppFramework/AndroidHttpTransaction";
+constexpr const char *kProxyClass = "com/popcap/SexyAppFramework/AndroidHttpProxy";
 
 /* thiz (the transaction jobject) -> nativeTransaction (its C++ pointer, the
  * jlong the constructor was handed). Captured at <init> because that is the only
@@ -110,9 +112,43 @@ void release(DexCall &d) {
 void status_zero(DexCall &d) { d.ret(0); }
 void empty_string(DexCall &d) { d.ret_string(""); }
 
+/* --- AndroidHttpProxy ------------------------------------------------------
+ *
+ * int GetNetworkStatus() -- Android's connectivity, as the engine sees it:
+ * 0 = none, 1 = mobile/WiMax, 2 = Wi-Fi, 3 = disconnected.
+ *
+ * Hooked only to make the answer configurable and visible; the default (0) is
+ * what an unhooked method returned anyway, and it must stay there. Reporting a
+ * connection was tried and it does NOT work: the loading screen then waits on
+ * downloads this port can never deliver and the game never reaches the menu.
+ *
+ * The engine reuses this one answer for a second, unrelated decision -- whether
+ * a purchase may start -- which is why buying reported "Service Unavailable"
+ * while the answer was 0. That half is fixed where it belongs, by rewriting the
+ * purchase broker's own connectivity check in the loaded image; see
+ * game/patches.h. Nothing here needs to lie for the store to work.
+ *
+ * Startup() is deliberately NOT hooked: it still answers false, the way it did
+ * while the boot was being brought up, and nothing consults it here. */
+void get_network_status(DexCall &d) {
+    const int status = pvz2_config()->network_status;
+    /* Said once: the engine polls this every frame on some screens, and the
+     * answer is a constant read out of the config. */
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        d.c.log("[net] GetNetworkStatus -> %d (%s); requests still fail, only the "
+                "engine's idea of connectivity changes",
+                status, status == 2 ? "wifi" : status == 1 ? "mobile" : "no network");
+    }
+    d.ret((std::uint32_t)status);
+}
+
 }  // namespace
 
 void register_android_http(HookTable &t) {
+    t.add(kProxyClass, "GetNetworkStatus", get_network_status);
+
     t.add(kClass, "<init>", ctor);
     t.add(kClass, "Start", start);
     t.add(kClass, "Release", release);

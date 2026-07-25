@@ -4,6 +4,9 @@
 #include <glad/gl.h>
 #include <pvz2native/config.h>
 #include <pvz2native/game_parameters.h>
+#include <pvz2native/gfx/frame_limiter.h>
+#include <pvz2native/gfx/gl_requirements.h>
+#include <pvz2native/gfx/video_mode.h>
 #include <pvz2native/input/input_queue.h>
 #include <pvz2native/pvz2_session.h>
 
@@ -85,6 +88,14 @@ static void sync_text_input(void) {
 static SDL_Window *g_window = NULL;
 static int g_quit_requested = 0;
 
+/* Current borderless-fullscreen state; F11 toggles it. */
+static int g_fullscreen = 0;
+
+/* Flipped once pvz2_session_start returns. While 0 the window title shows the
+ * boot progress (the boot is minutes of dark window and this is the only sign
+ * it is alive); once 1 the title shows the live FPS instead. */
+static int g_booted = 0;
+
 /* Re-reads the window's drawable size and re-renders the game at it: the
  * compositor is told the new size immediately (so THIS frame already fills the
  * window), and the engine re-runs onSurfaceChanged so it re-fits its projection.
@@ -118,6 +129,58 @@ static void handle_quit(void) {
     exit(0);
 }
 
+/* F11 toggles borderless fullscreen. FULLSCREEN_DESKTOP (not real fullscreen)
+ * keeps the desktop resolution and just borderlessly fills the screen, which
+ * avoids a mode switch and plays well with the compositor scaling. The size
+ * change it causes arrives as SDL_WINDOWEVENT_SIZE_CHANGED, so update_window_size
+ * re-fits the engine the same way an ordinary resize does -- nothing extra here. */
+static void toggle_fullscreen(void) {
+    if (!g_window) return;
+    g_fullscreen = !g_fullscreen;
+    SDL_SetWindowFullscreen(g_window, g_fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+}
+
+/* The single place an SDL event turns into an action. Both drain sites -- the
+ * boot-time host_pump and the steady-state loop -- route through here so quit,
+ * F11 and resize behave identically in both, and adding a shortcut is a one-line
+ * change in one function rather than two that have to be kept in sync. */
+static void handle_sdl_event(const SDL_Event *e) {
+    if (e->type == SDL_QUIT ||
+        (e->type == SDL_KEYDOWN && e->key.keysym.sym == SDLK_ESCAPE)) {
+        handle_quit();
+    } else if (e->type == SDL_KEYDOWN && e->key.keysym.sym == SDLK_F11 && e->key.repeat == 0) {
+        toggle_fullscreen();
+    } else if (e->type == SDL_WINDOWEVENT &&
+               e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+        update_window_size();
+    }
+    /* Also fed to the input queue: F11/ESC map to no guest key, so this is safe,
+     * and anything typed or clicked during the boot still reaches the engine. */
+    feed_input_event(e);
+}
+
+/* Once-per-half-second FPS in the window title, from real presented frames.
+ * This replaced the old per-frame "Native_onDrawFrame[N]" status text, which
+ * churned a mutex and a SetWindowTitle every frame. Measured off the wall clock,
+ * so it is honest about dropped/duplicated frames. */
+static void update_fps_title(void) {
+    static Uint32 window_start = 0;
+    static int frames = 0;
+    static int started = 0;
+    Uint32 now = SDL_GetTicks();
+    if (!started) { window_start = now; started = 1; }
+    ++frames;
+    Uint32 elapsed = now - window_start;
+    if (elapsed >= 500) {
+        double fps = (double)frames * 1000.0 / (double)elapsed;
+        char title[64];
+        SDL_snprintf(title, sizeof(title), "PvZ2Native - %.0f FPS", fps);
+        if (g_window) SDL_SetWindowTitle(g_window, title);
+        frames = 0;
+        window_start = now;
+    }
+}
+
 /* Called from inside long guest calls (see pvz2_session_set_host_pump). The
  * boot sequence runs for minutes in one call, so without draining the message
  * queue the OS marks the window "Not responding" for all of startup. Rate
@@ -131,24 +194,20 @@ static void host_pump(void) {
 
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
-        if (event.type == SDL_QUIT ||
-            (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
-            handle_quit();
-        } else if (event.type == SDL_WINDOWEVENT &&
-                   event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-            update_window_size();
-        }
-        /* Also collected here: the boot runs for seconds inside a single guest
-         * call, and anything typed or clicked in that window would otherwise be
-         * discarded by this drain rather than reaching the queue. */
-        feed_input_event(&event);
+        /* The boot runs for seconds inside a single guest call, so events
+         * (including a close or an F11) have to be acted on here too, not just
+         * in the steady-state loop -- hence the shared handler. */
+        handle_sdl_event(&event);
     }
     sync_text_input();
 
-    /* The boot takes minutes behind a dark window; without this there is no
-     * way to tell a working startup from a hang. Title updates need no GL, so
-     * they are safe while the guest owns the context. */
-    if (g_window) {
+    /* The boot takes minutes behind a dark window; without this there is no way
+     * to tell a working startup from a hang. Only while booting: once the game
+     * is running the steady-state loop owns the title and shows the FPS instead
+     * (host_pump still runs between JIT slices inside a frame, so this guard is
+     * what stops it from fighting update_fps_title over the title). Title updates
+     * need no GL, so they are safe while the guest owns the context. */
+    if (g_window && !g_booted) {
         char status[160];
         char title[224];
         pvz2_session_status(status, sizeof(status));
@@ -199,13 +258,18 @@ int main(int argc, char **argv) {
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    /* The window defaults to the engine's render size and is freely resizable;
-     * the compositor scales the fixed-resolution scene to whatever size it
-     * becomes, and update_window_size keeps input and the composite viewport in
-     * step. */
-    pvz2_render_size(&g_render_w, &g_render_h);
+    /* The launch resolution, resolved from [video] (auto-aspect by default) and
+     * the display -- see gfx/video_mode. The engine renders AT this size and the
+     * touch space is frozen to it; the window stays freely resizable and
+     * update_window_size re-fits the engine on any later resize. pvz2_set_render_size
+     * has to run before pvz2_session_start so the guest surface starts here too. */
+    int start_fullscreen = 0;
+    pvz2_choose_window_size(&g_render_w, &g_render_h, &start_fullscreen);
+    pvz2_set_render_size(g_render_w, g_render_h);
     g_win_w = g_render_w;
     g_win_h = g_render_h;
+    printf("video: launching at %dx%d%s\n", g_render_w, g_render_h,
+           start_fullscreen ? " (fullscreen)" : "");
     SDL_Window *window = SDL_CreateWindow("PvZ2Native", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                            g_render_w, g_render_h,
                                            SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
@@ -224,17 +288,14 @@ int main(int argc, char **argv) {
     }
     SDL_GL_MakeCurrent(window, gl_context);
 
-    /* Cap the frame rate to the display via vsync. The engine advances its
-     * simulation from the real wall clock (gettimeofday), not from a frame
-     * count, so presenting fewer frames does NOT slow the game down -- it only
-     * stops the loop from spinning onDrawFrame thousands of times a second and
-     * pinning a core at 100%. That is the single biggest win for a weak CPU like
-     * the N2805: it drops the per-second work by roughly the ratio of that
-     * uncapped rate to the refresh rate. Adaptive vsync first (no stutter when a
-     * frame misses vblank), plain vsync if the driver lacks it. */
-    if (SDL_GL_SetSwapInterval(-1) != 0) {
-        SDL_GL_SetSwapInterval(1);
-    }
+    /* Cap the frame rate ([video] fps_limit, vsync + pacing -- see gfx/frame_limiter).
+     * The engine advances its simulation from the real wall clock (gettimeofday),
+     * not from a frame count, so presenting fewer frames does NOT slow the game
+     * down -- it only stops the loop from spinning onDrawFrame thousands of times
+     * a second and pinning a core at 100%. That is the single biggest win for a
+     * weak CPU like the N2805: it drops the per-second work by roughly the ratio
+     * of that uncapped rate to the capped one. */
+    pvz2_frame_limit_init();
 
     int glad_version = gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress);
     if (glad_version == 0) {
@@ -246,6 +307,25 @@ int main(int argc, char **argv) {
     }
     printf("GL context ready: %s (loaded via glad %d.%d)\n", (const char *)glGetString(GL_VERSION),
            GLAD_VERSION_MAJOR(glad_version), GLAD_VERSION_MINOR(glad_version));
+
+    /* Verify the GPU can actually run the engine (OpenGL 2.0 + framebuffer
+     * objects) BEFORE loading the .so. A GPU that falls short is shown a message
+     * box naming it and the versions, then the app exits cleanly instead of
+     * booting for seconds only to render a silent black window. Running this also
+     * latches the GLSL dialect the shader shim will emit (120 vs 130). */
+    if (!pvz2_gl_check_requirements(window)) {
+        SDL_GL_DeleteContext(gl_context);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    /* Apply the configured fullscreen state now that the window and context
+     * exist; the resulting size change is handled like any other resize. */
+    if (start_fullscreen) {
+        g_fullscreen = 1;
+        SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    }
 
     /* Resolved from config.ini above: <exe>/lib/libPVZ2.so by default, or the
      * [paths] so override. The matching .obb is resolved the same way and read
@@ -267,6 +347,9 @@ int main(int argc, char **argv) {
      * of the game whose addresses we do not have (see src/game/symbols.cpp). */
     int exit_code = session ? 0 : 1;
 
+    /* Boot is done: from here the title shows FPS, not boot progress. */
+    g_booted = 1;
+
     if (session) {
         /* The window's real drawable size (HiDPI can differ from the requested
          * size), handed to the compositor before the first frame. */
@@ -277,14 +360,7 @@ int main(int argc, char **argv) {
         while (running) {
             SDL_Event event;
             while (SDL_PollEvent(&event)) {
-                if (event.type == SDL_QUIT ||
-                    (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE)) {
-                    handle_quit();
-                } else if (event.type == SDL_WINDOWEVENT &&
-                           event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
-                    update_window_size();
-                }
-                feed_input_event(&event);
+                handle_sdl_event(&event);
             }
             sync_text_input();
             if (!running || g_quit_requested) break;
@@ -306,6 +382,10 @@ int main(int argc, char **argv) {
              * the swap -- not on a worker. */
             if (!pvz2_session_frame(session)) break;
             SDL_GL_SwapWindow(window);
+            update_fps_title();
+            /* After the swap and the title, so the wait is the last thing in the
+             * frame and the FPS shown is measured over the paced interval. */
+            pvz2_frame_limit_wait();
         }
         pvz2_session_end(session);
     }

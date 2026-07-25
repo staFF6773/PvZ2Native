@@ -13,6 +13,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -282,11 +283,13 @@ void fs_block_size(DexCall &d) { d.ret64(disk_space(d, 2)); }
  * with a store that forgets, that wait never ends. So the fix is to be a real
  * store -- honour writes, answer reads and existence from what was written.
  *
- * In-memory, for the running session. SharedPreferences also survives across
- * launches, but not persisting is deliberate for now: it means every run is a
- * clean first launch, which is what you want while bringing a version up. The
- * only contract the stall needs is write-then-read WITHIN a session, and that
- * this gives exactly. Persistence to a file is a later, additive change.
+ * It also survives across launches, and now so does this store: it is loaded
+ * once from <save_dir>/prefs.dat and rewritten on every change, gated by
+ * [game] persist_saves (on by default). That is what fixes the age gate --
+ * without it the engine wrote the entered age, could read it back within the
+ * session, but found the store empty on the next launch and asked again every
+ * time. persist_saves=0 restores the old "every run is a clean first launch"
+ * behaviour, which is still what you want while bringing a version up.
  *
  * Booleans and integers share one numeric map because a key is only ever read
  * back as the type it was written; strings are separate. ConfigKeyExists checks
@@ -296,8 +299,94 @@ struct ConfigStore {
     std::map<std::string, std::string> strings;
     std::map<std::string, std::int64_t> numbers;
 };
+
+std::string prefs_path() {
+    return std::string(pvz2_config()->save_dir) + "/prefs.dat";
+}
+
+/* A tiny length-prefixed binary format, so a key or a string value may contain
+ * any byte (spaces, '=', newlines) without an escaping scheme:
+ *   'S' u32 keylen key u32 vallen val   -- a string entry
+ *   'N' u32 keylen key i64 val          -- a numeric entry
+ * A short read stops parsing and keeps whatever was read, so a truncated file
+ * degrades to a partial store rather than a crash. */
+bool read_u32(std::FILE *f, std::uint32_t &v) {
+    return std::fread(&v, sizeof(v), 1, f) == 1;
+}
+bool read_key(std::FILE *f, std::string &key) {
+    std::uint32_t n = 0;
+    if (!read_u32(f, n) || n > (1u << 20)) return false;
+    key.resize(n);
+    return n == 0 || std::fread(&key[0], 1, n, f) == n;
+}
+
+/* Both callers hold s.lock. */
+void store_load_locked(ConfigStore &s) {
+    if (!pvz2_config()->persist_saves) return;
+    std::FILE *f = std::fopen(prefs_path().c_str(), "rb");
+    if (f == nullptr) return;
+    int type;
+    while ((type = std::fgetc(f)) != EOF) {
+        std::string key;
+        if (!read_key(f, key)) break;
+        if (type == 'S') {
+            std::uint32_t vlen = 0;
+            if (!read_u32(f, vlen) || vlen > (1u << 24)) break;
+            std::string val(vlen, '\0');
+            if (vlen != 0 && std::fread(&val[0], 1, vlen, f) != vlen) break;
+            s.strings[key] = std::move(val);
+        } else if (type == 'N') {
+            std::int64_t val = 0;
+            if (std::fread(&val, sizeof(val), 1, f) != 1) break;
+            s.numbers[key] = val;
+        } else {
+            break; /* unknown record -- stop rather than resync blindly */
+        }
+    }
+    std::fclose(f);
+}
+
+void store_save_locked(ConfigStore &s) {
+    if (!pvz2_config()->persist_saves) return;
+    std::error_code ec;
+    std::filesystem::create_directories(pvz2_config()->save_dir, ec);
+    /* Write to a temp file and rename over the target, so an interrupted write
+     * cannot leave a half-written prefs file that fails to load next launch. */
+    const std::string path = prefs_path();
+    const std::string tmp = path + ".tmp";
+    std::FILE *f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) return;
+    for (const auto &kv : s.strings) {
+        const std::uint32_t klen = (std::uint32_t)kv.first.size();
+        const std::uint32_t vlen = (std::uint32_t)kv.second.size();
+        std::fputc('S', f);
+        std::fwrite(&klen, sizeof(klen), 1, f);
+        std::fwrite(kv.first.data(), 1, klen, f);
+        std::fwrite(&vlen, sizeof(vlen), 1, f);
+        std::fwrite(kv.second.data(), 1, vlen, f);
+    }
+    for (const auto &kv : s.numbers) {
+        const std::uint32_t klen = (std::uint32_t)kv.first.size();
+        const std::int64_t val = kv.second;
+        std::fputc('N', f);
+        std::fwrite(&klen, sizeof(klen), 1, f);
+        std::fwrite(kv.first.data(), 1, klen, f);
+        std::fwrite(&val, sizeof(val), 1, f);
+    }
+    std::fclose(f);
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) std::filesystem::remove(tmp, ec); /* rename failed; don't leave the temp behind */
+}
+
 ConfigStore &config_store() {
     static ConfigStore store;
+    static std::once_flag once;
+    /* Loaded exactly once, on first use -- by which point pvz2_config_load has
+     * long run (it happens in main before the session starts). */
+    std::call_once(once, [] {
+        std::lock_guard<std::mutex> lk(store.lock);
+        store_load_locked(store);
+    });
     return store;
 }
 
@@ -328,6 +417,7 @@ void config_erase_key(DexCall &d) {
     std::lock_guard<std::mutex> lk(s.lock);
     s.strings.erase(key);
     s.numbers.erase(key);
+    store_save_locked(s);
     d.ret(0);
 }
 
@@ -368,6 +458,7 @@ void config_write_string(DexCall &d) {
     std::lock_guard<std::mutex> lk(s.lock);
     s.strings[key] = d.string_arg(1);
     s.numbers.erase(key); /* a key is one type at a time, like SharedPreferences */
+    store_save_locked(s);
     d.ret_bool(true);
 }
 
@@ -378,6 +469,7 @@ void config_write_integer(DexCall &d) {
     std::lock_guard<std::mutex> lk(s.lock);
     s.numbers[key] = (std::int32_t)d.arg(1);
     s.strings.erase(key);
+    store_save_locked(s);
     d.ret_bool(true);
 }
 
@@ -388,6 +480,7 @@ void config_write_boolean(DexCall &d) {
     std::lock_guard<std::mutex> lk(s.lock);
     s.numbers[key] = d.arg(1) != 0 ? 1 : 0;
     s.strings.erase(key);
+    store_save_locked(s);
     d.ret_bool(true);
 }
 
@@ -411,6 +504,11 @@ void open_url(DexCall &d) {
 void product_version(DexCall &d) { d.ret_string("1"); }
 void product_version_string(DexCall &d) { d.ret_string("1.6.2"); }
 void currency_symbol(DexCall &d) { d.ret_string("$"); }
+/* Info_SysGetUserCurrencyCode -- the ISO 4217 code (e.g. "USD"). Unhooked it
+ * returned null, and the in-app store treats a null currency as "store not
+ * configured", which surfaces as the "Service Unavailable" purchase dialog. USD
+ * is a safe default; the purchases are emulated and free either way. */
+void currency_code(DexCall &d) { d.ret_string("USD"); }
 void package_name(DexCall &d) { d.ret_string("com.ea.game.pvz2_na"); } /* matches the real .obb name */
 void activity_name(DexCall &d) { d.ret_string("com.popcap.PvZ2.PvZ2GameActivity"); }
 /* Both come from [game] user_locale in config.ini (default "en_US"). The country
@@ -482,6 +580,7 @@ void register_android_game_app(HookTable &t) {
     t.add(kClass, "Info_SysGetProductVersion", product_version);
     t.add(kClass, "Info_SysGetProductVersionString", product_version_string);
     t.add(kClass, "Info_SysGetUserCurrencySymbol", currency_symbol);
+    t.add(kClass, "Info_SysGetUserCurrencyCode", currency_code);
     t.add(kClass, "Info_SysGetPackageName", package_name);
     t.add(kClass, "Info_SysGetActivityName", activity_name);
     t.add(kClass, "Info_SysGetUserLocale", user_locale);

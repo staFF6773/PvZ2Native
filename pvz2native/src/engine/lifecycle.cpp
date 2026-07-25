@@ -104,7 +104,7 @@ void run_surface_changed(pvz2_elf_image_t *img, GuestRuntime *rt, std::uint32_t 
 
 void run_surface_lifecycle(pvz2_elf_image_t *img, GuestRuntime *rt) {
     rt_::run_at_offset(img, rt, "Native_onSurfaceCreated", sym().native.on_surface_created, {});
-    run_surface_changed(img, rt, rt_::kWindowWidth, rt_::kWindowHeight);
+    run_surface_changed(img, rt, rt_::window_width(), rt_::window_height());
     rt_::run_at_offset(img, rt, "Native_applicationDidBecomeActive",
                        sym().native.application_did_become_active, {0});
 }

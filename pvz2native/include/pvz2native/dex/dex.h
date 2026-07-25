@@ -67,6 +67,22 @@ void install(pvz2_elf_image_t *img);
 bool owns_svc(std::uint32_t swi);
 void dispatch_svc(GuestCall &c, std::uint32_t swi);
 
+/* --- registered natives -------------------------------------------------- *
+ *
+ * RegisterNatives records the (class, method) -> guest function address the
+ * engine binds for each Java `native` method, so this port can call one back the
+ * way real Java would -- the emulated purchase driver needs it to invoke
+ * FirePaymentComplete / FireDidRefresh. Recorded generically; find returns 0 for
+ * a pair that was never registered. */
+void register_native_method(const std::string &class_name, const std::string &method,
+                            std::uint32_t fn_addr);
+std::uint32_t find_native_method(const std::string &class_name, const std::string &method);
+
+/* Records the element count of an object array a hook built, so GetArrayLength
+ * reports elements rather than bytes for it -- see the g_array_lengths note in
+ * jni_env.cpp. Only affects the exact handle passed. */
+void set_array_length(std::uint32_t array, std::uint32_t count);
+
 /* --- what a hook receives ------------------------------------------------ */
 
 /* One CallXxxMethod arriving from guest code, already resolved to the real
@@ -149,8 +165,17 @@ void register_android_http(HookTable &t);
 void register_framework_activity(HookTable &t);
 void register_google_play(HookTable &t);
 void register_facebook(HookTable &t);
+void register_purchase_driver(HookTable &t);
 
 const HookTable &hook_table();
+
+/* Delivers any purchase results the emulated store owes the engine -- see
+ * hooks/purchase_driver.cpp. Called once per frame from the session, BETWEEN
+ * top-level guest calls, because completing a purchase means calling an engine
+ * native and doing that reentrantly from inside RequestPayment could corrupt the
+ * engine's own purchase state. A no-op when [game] emulate_iap is off or nothing
+ * is pending. */
+void iap_deliver_pending(pvz2_elf_image_t *img, GuestRuntime *rt);
 
 /* --- host configuration -------------------------------------------------- *
  *

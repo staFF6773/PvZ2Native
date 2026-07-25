@@ -31,7 +31,7 @@ pvz2_config_t g_config{};
 
 /* Default resource file names, resolved under <exe_dir>/lib. */
 constexpr char kDefaultSoName[]  = "libPVZ2.so";
-constexpr char kDefaultObbName[] = "main.7.com.ea.game.pvz2_na.obb";
+constexpr char kDefaultObbName[] = "main.147.com.ea.game.pvz2_row.obb";
 
 /* Written verbatim to config.ini the first time the game runs without one. It
  * is all-off, so seeding it changes nothing about the run -- it just documents
@@ -76,12 +76,42 @@ constexpr char kDefaultIni[] =
     "; Query GL state on every suspicious call and report mismatches.\n"
     "strict = 0\n"
     "\n"
+    "[video]\n"
+    "; Launch resolution. The window is always resizable and the engine re-fits\n"
+    "; on resize, so this is only the STARTING size.\n"
+    ";   mode = auto   -> match the display's aspect at a moderate base height\n"
+    ";                    (light on the GPU; 4:3/16:10/16:9 each get right shape)\n"
+    ";   mode = native -> match the display's full resolution (sharpest, heaviest)\n"
+    "; An explicit width AND height (both > 0) override mode and are used as-is.\n"
+    "mode = auto\n"
+    "; width = 0\n"
+    "; height = 0\n"
+    "; Start borderless-fullscreen (F11 toggles it at runtime either way).\n"
+    "fullscreen = 0\n"
+    "; Frame-rate cap, in FPS. The simulation runs off the wall clock, so a lower\n"
+    "; cap does not slow the game down -- it only stops the loop from redrawing as\n"
+    "; fast as the CPU allows and pinning a core. Vsync stays on, so what reaches\n"
+    "; the screen is whichever is lower, this or the monitor's refresh rate.\n"
+    ";   0 = no limit at all (vsync off too: tearing, one core saturated).\n"
+    "fps_limit = 60\n"
+    "\n"
     "[game]\n"
     "; Locale the engine is told the device uses, as <lang>_<REGION>. Steers\n"
     "; currency, store region and which localized text loads; an unavailable\n"
     "; language falls back to English. The country code is taken from the part\n"
     "; after '_'. Leave commented for en_US.\n"
-    "; user_locale = en_US\n";
+    "; user_locale = en_US\n"
+    "; Emulated in-app purchases: on = the store is available and every purchase\n"
+    "; the game requests completes for free; off = store reports not supported.\n"
+    "emulate_iap = 1\n"
+    "; Persist the game's saved settings (age gate, options) to the save folder\n"
+    "; so they survive a restart. Off makes every launch a clean first run.\n"
+    "persist_saves = 1\n"
+    "; What the game is told about network connectivity: none, mobile or wifi.\n"
+    "; Leave it at none. The port has no network stack, and telling the engine it\n"
+    "; is online makes the loading screen wait forever for downloads that can\n"
+    "; never arrive. The store does NOT need this -- it is emulated locally.\n"
+    "network = none\n";
 
 std::string trim(const std::string &s) {
     std::size_t a = 0, b = s.size();
@@ -152,6 +182,35 @@ void apply(const std::string &section, const std::string &key, const std::string
     } else if (section == "game") {
         if (key == "user_locale" && !trim(val).empty())
             std::snprintf(g_config.user_locale, sizeof(g_config.user_locale), "%s", trim(val).c_str());
+        else if (key == "emulate_iap")  g_config.emulate_iap = parse_bool(val);
+        else if (key == "persist_saves") g_config.persist_saves = parse_bool(val);
+        else if (key == "network") {
+            /* Named rather than numeric because the numbers are Android's
+             * (AndroidHttpProxy.GetNetworkStatus), not something a player should
+             * have to know. An unrecognised word keeps the default. */
+            const std::string t = lower(trim(val));
+            if (t == "wifi" || t == "on" || t == "1" || t == "true" || t == "yes")
+                g_config.network_status = 2;
+            else if (t == "mobile" || t == "cell")
+                g_config.network_status = 1;
+            else if (t == "none" || t == "off" || t == "0" || t == "false" || t == "no")
+                g_config.network_status = 0;
+        }
+    } else if (section == "video") {
+        if (key == "mode" && !trim(val).empty())
+            std::snprintf(g_config.video_mode, sizeof(g_config.video_mode), "%s", lower(trim(val)).c_str());
+        else if (key == "width")      g_config.video_width = (int)std::strtol(val.c_str(), nullptr, 0);
+        else if (key == "height")     g_config.video_height = (int)std::strtol(val.c_str(), nullptr, 0);
+        else if (key == "fullscreen") g_config.video_fullscreen = parse_bool(val);
+        else if (key == "fps_limit" || key == "fpslimit") {
+            const std::string t = trim(val);
+            char *end = nullptr;
+            const long v = std::strtol(t.c_str(), &end, 10);
+            /* A value with no digits at all (typo, empty) keeps the 120 default
+             * rather than reading as 0 and silently uncapping the loop; a real
+             * number <= 0 is the documented "no limit". */
+            if (end != t.c_str()) g_config.fps_limit = v > 0 ? (int)v : 0;
+        }
     }
     /* Unknown (section, key) pairs are silently ignored. */
 }
@@ -187,6 +246,17 @@ void seed_default(const char *ini_path) {
 extern "C" void pvz2_config_load(const char *ini_path, const char *base_dir) {
     g_config = pvz2_config_t{}; /* reset to all-off before (re)reading */
 
+    /* Values whose default is not "off" must be set BEFORE parsing, so that an
+     * explicit entry in the file can still override them (parse only writes keys
+     * that are present) -- and so that a config.ini written by an OLDER build,
+     * which has no line for a newer key at all, gets the intended default rather
+     * than a zero that means something else entirely (fps_limit 0 = uncapped,
+     * network 0 = offline, which disables the store). */
+    g_config.emulate_iap = 1;
+    g_config.persist_saves = 1;
+    g_config.fps_limit = 60;     /* matches the seeded config.ini */
+    g_config.network_status = 0; /* offline: anything else never finishes loading */
+
     if (ini_path != nullptr) {
         FILE *f = std::fopen(ini_path, "rb");
         if (f == nullptr) {          /* first run: write the documented default */
@@ -213,6 +283,17 @@ extern "C" void pvz2_config_load(const char *ini_path, const char *base_dir) {
 
     if (g_config.user_locale[0] == '\0')
         std::snprintf(g_config.user_locale, sizeof(g_config.user_locale), "en_US");
+
+    /* Same "concrete after load" contract as the resource paths: a relative
+     * save_dir is resolved against the exe folder, and an unset one defaults to
+     * <exe_dir>/save, so the dex layer can read one absolute path. */
+    if (g_config.save_dir[0] == '\0')
+        set_path(g_config.save_dir, base_with_sep(base_dir) + "save");
+    else
+        resolve_relative(g_config.save_dir, base_dir);
+
+    if (g_config.video_mode[0] == '\0')
+        std::snprintf(g_config.video_mode, sizeof(g_config.video_mode), "auto");
 }
 
 extern "C" const pvz2_config_t *pvz2_config(void) { return &g_config; }

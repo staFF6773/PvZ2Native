@@ -26,6 +26,7 @@
 #include <pvz2native/dex/dex.h>
 #include <pvz2native/diagnostics/diagnostics.h>
 #include <pvz2native/engine/engine.h>
+#include <pvz2native/game/patches.h>
 #include <pvz2native/game/symbols.h>
 #include <pvz2native/pvz2_session.h>
 #include <pvz2native/runtime/dynarmic_config.h>
@@ -73,8 +74,12 @@ struct pvz2_session {
 extern "C" void pvz2_session_set_host_pump(pvz2_host_pump_fn fn) { rt_::set_host_pump(fn); }
 
 extern "C" void pvz2_render_size(int *width, int *height) {
-    if (width) *width = (int)rt_::kWindowWidth;
-    if (height) *height = (int)rt_::kWindowHeight;
+    if (width) *width = (int)rt_::window_width();
+    if (height) *height = (int)rt_::window_height();
+}
+
+extern "C" void pvz2_set_render_size(int width, int height) {
+    rt_::set_window_size((std::uint32_t)width, (std::uint32_t)height);
 }
 
 extern "C" void pvz2_set_drawable_size(int width, int height) {
@@ -120,6 +125,11 @@ extern "C" pvz2_session_t *pvz2_session_start(const char *so_path) {
         return nullptr;
     }
 
+    /* Rewrites of the guest's own code, now that the build is known and while
+     * nothing has executed yet -- dynarmic caches translated blocks, so a later
+     * write would not be seen by anything already run. See game/patches.h. */
+    pvz2native::game_apply_patches(&s->img);
+
     /* Must precede the first Jit: UserConfig captures the page table pointer at
      * construction, and the Jits are long-lived now. */
     rt_::build_page_table(&s->img);
@@ -129,9 +139,9 @@ extern "C" pvz2_session_t *pvz2_session_start(const char *so_path) {
     rt_::build_import_handler_cache(&s->img);
     pvz2native::initialize_data_imports(&s->img, &s->rt);
 
-    dex::set_screen_size(rt_::kWindowWidth, rt_::kWindowHeight);
+    dex::set_screen_size(rt_::window_width(), rt_::window_height());
     /* Same size, but the GL layer needs it independently -- see gl_glViewport. */
-    pvz2native::set_drawable_size(rt_::kWindowWidth, rt_::kWindowHeight);
+    pvz2native::set_drawable_size(rt_::window_width(), rt_::window_height());
     dex::install(&s->img);
 
     s->rt.img = &s->img;
@@ -194,6 +204,13 @@ extern "C" int pvz2_session_frame(pvz2_session_t *s) {
         pvz2native::trace::set(false);
         std::printf("pvz2: ==== end steady-state sample ====\n");
         std::fflush(stdout);
+    }
+
+    /* Grant any purchase the emulated store owes the engine, here between
+     * top-level guest calls rather than reentrantly from inside RequestPayment
+     * -- see dex::iap_deliver_pending. */
+    if (pvz2_config()->emulate_iap) {
+        dex::iap_deliver_pending(&s->img, &s->rt);
     }
 
     engine::draw_frame(&s->img, &s->rt, s->frames_run);

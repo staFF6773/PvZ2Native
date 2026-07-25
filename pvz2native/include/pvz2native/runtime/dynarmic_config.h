@@ -50,11 +50,16 @@ constexpr std::uint32_t kThreadStackSize = 0x00100000; /* 1MB each, 8 slots -> 0
 constexpr std::uint32_t kStackTop = 0x16000000;
 constexpr std::uint32_t kAddressSpaceSize = 0x18000000; /* 384MB */
 
-/* The size we tell the guest its surface is. Must match the SDL window in
- * main.c: the engine derives its whole projection from this via
- * Graphics_GetScreenSizeInPixels -> LawnApp::SetWidthHeight. */
-constexpr std::uint32_t kWindowWidth = 960;
-constexpr std::uint32_t kWindowHeight = 540;
+/* The size we tell the guest its surface is. Chosen once at startup (main.c
+ * calls set_window_size from the resolved [video] settings before the session
+ * starts) and constant thereafter; a runtime window RESIZE is a separate path
+ * that re-runs onSurfaceChanged (see pvz2_session_request_resize). Defaults to
+ * 960x540. Must match the SDL window in main.c: the engine derives its whole
+ * projection from this via Graphics_GetScreenSizeInPixels ->
+ * LawnApp::SetWidthHeight. */
+std::uint32_t window_width();
+std::uint32_t window_height();
+void set_window_size(std::uint32_t w, std::uint32_t h);
 
 /* Where the guest heap starts, and how big it is.
  *
@@ -368,6 +373,14 @@ const CallStats &last_call_stats();
  * clobber the call in progress. */
 std::uint32_t call_guest_quiet(pvz2_elf_image_t *img, GuestRuntime *rt, std::uint32_t offset,
                                std::uint32_t r0 = 0, std::uint32_t r1 = 0, std::uint32_t r2 = 0);
+
+/* Same, but with an arbitrary argument list laid out AAPCS-style (r0-r3, then the
+ * stack). For callbacks taking more than three words -- e.g. the purchase-driver
+ * natives, one of which takes a jlong plus six jstrings and a jboolean. The
+ * caller owns the layout: a jlong occupies an even/odd register pair, so it lands
+ * in r2:r3 when it is the first argument after (JNIEnv*, jobject). */
+std::uint32_t call_guest_quiet_args(pvz2_elf_image_t *img, GuestRuntime *rt, std::uint32_t offset,
+                                    const std::uint32_t *args, int nargs);
 
 /* Fabricates a fake jstring at a scratch address: a UTF-8 payload followed by a
  * NUL, so code that ends up dereferencing "the string's bytes" directly finds

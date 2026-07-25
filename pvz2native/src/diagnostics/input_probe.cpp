@@ -78,7 +78,7 @@ void dump_touch_scaler(pvz2_elf_image_t *img) {
                 skipped ? "  <-- DIVISOR ZERO: transform SKIPPED, raw pixels used" : "");
     if (!skipped) {
         /* Where a click in the middle of the window actually lands. */
-        const int mx = (int)runtime::kWindowWidth / 2, my = (int)runtime::kWindowHeight / 2;
+        const int mx = (int)runtime::window_width() / 2, my = (int)runtime::window_height() / 2;
         std::printf("pvz2: [input] window centre (%d,%d) maps to app (%d,%d)\n", mx, my,
                     f[0] + (mx - f[4]) * f[2] / f[6], f[1] + (my - f[5]) * f[3] / f[7]);
     }

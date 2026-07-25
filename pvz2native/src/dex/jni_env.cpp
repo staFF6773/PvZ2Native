@@ -108,6 +108,22 @@ constexpr std::uint32_t kSlotCount = sizeof(kSlotNames) / sizeof(kSlotNames[0]);
 std::uint32_t g_screen_width = 1280;
 std::uint32_t g_screen_height = 720;
 
+/* (class, method) -> guest address of the engine native RegisterNatives bound.
+ * Written during JNI_OnLoad, read when a hook calls a native back. */
+std::mutex g_natives_lock;
+std::map<std::pair<std::string, std::string>, std::uint32_t> g_native_methods;
+
+/* Element counts for object arrays a hook builds and hands back to the engine.
+ *
+ * GetArrayLength answers heap.size_of(), which is the allocation in BYTES. That
+ * is correct for a byte array (one byte per element) but not for an object array
+ * (four bytes each): a hook that fabricates a jobject[] of n entries would have
+ * the engine iterate 4n times and read 3n words of garbage past the end. So an
+ * array registered here reports its real element count; everything else keeps
+ * the byte-size answer, which is what the existing byte-array users rely on. */
+std::mutex g_arraylen_lock;
+std::map<std::uint32_t, std::uint32_t> g_array_lengths;
+
 /* --------------------------------------------------------------- census */
 
 struct CensusRow {
@@ -314,7 +330,9 @@ void handle_jni(GuestCall &c, std::uint32_t slot) {
     } else if (name_is(name, "NewLongArray") || name_is(name, "NewDoubleArray")) {
         regs[0] = c.rt->heap.alloc(regs[1] * 8u);
     } else if (name_is(name, "GetArrayLength")) {
-        regs[0] = c.rt->heap.size_of(regs[1]);
+        std::lock_guard<std::mutex> lk(g_arraylen_lock);
+        auto it = g_array_lengths.find(regs[1]);
+        regs[0] = (it != g_array_lengths.end()) ? it->second : c.rt->heap.size_of(regs[1]);
     } else if ((starts_with(name, "Get") && ends_with(name, "ArrayElements")) ||
                name_is(name, "GetPrimitiveArrayCritical") || name_is(name, "GetStringCritical")) {
         if (regs[2] != 0) c.write32(regs[2], 0); /* *isCopy = JNI_FALSE */
@@ -352,6 +370,26 @@ void handle_jni(GuestCall &c, std::uint32_t slot) {
         regs[0] = regs[1];
     } else if (name_is(name, "GetDirectBufferCapacity")) {
         regs[0] = c.rt->heap.size_of(regs[1]);
+    }
+    /* --- registered natives ---
+     *
+     * RegisterNatives(clazz, JNINativeMethod methods[], nMethods). Each
+     * JNINativeMethod is three pointers -- name, signature, fnPtr -- so 12 bytes
+     * apart. Recording (class, name) -> fnPtr is what lets a hook call one of the
+     * engine's own natives back (the purchase driver's FirePaymentComplete); left
+     * unhooked this returned JNI_OK and silently threw the addresses away. */
+    else if (name_is(name, "RegisterNatives")) {
+        const std::string cn = c.rt->class_name_of_handle(regs[1]);
+        const std::uint32_t methods = regs[2];
+        const std::uint32_t count = regs[3];
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const std::uint32_t entry = methods + i * 12;
+            const std::uint32_t name_ptr = c.read32(entry + 0);
+            const std::uint32_t fn_ptr = c.read32(entry + 8);
+            if (name_ptr == 0 || fn_ptr == 0) continue;
+            register_native_method(cn, c.cstr(name_ptr, 256), fn_ptr);
+        }
+        regs[0] = 0; /* JNI_OK */
     }
     /* --- calls into Java ---
      *
@@ -419,6 +457,22 @@ void set_screen_size(std::uint32_t width, std::uint32_t height) {
 }
 std::uint32_t screen_width() { return g_screen_width; }
 std::uint32_t screen_height() { return g_screen_height; }
+
+void register_native_method(const std::string &class_name, const std::string &method,
+                            std::uint32_t fn_addr) {
+    std::lock_guard<std::mutex> lk(g_natives_lock);
+    g_native_methods[std::make_pair(class_name, method)] = fn_addr;
+}
+std::uint32_t find_native_method(const std::string &class_name, const std::string &method) {
+    std::lock_guard<std::mutex> lk(g_natives_lock);
+    auto it = g_native_methods.find(std::make_pair(class_name, method));
+    return it == g_native_methods.end() ? 0 : it->second;
+}
+
+void set_array_length(std::uint32_t array, std::uint32_t count) {
+    std::lock_guard<std::mutex> lk(g_arraylen_lock);
+    g_array_lengths[array] = count;
+}
 
 std::uint32_t DexCall::arg(int i) const {
     if (va == 0) {
@@ -521,6 +575,7 @@ const HookTable &hook_table() {
         register_framework_activity(t);
         register_google_play(t);
         register_facebook(t);
+        register_purchase_driver(t);
         return t;
     }();
     return table;

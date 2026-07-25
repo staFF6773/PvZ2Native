@@ -14,7 +14,7 @@
 namespace pvz2native {
 namespace {
 
-const GameSymbols kUnknown{"unknown", {}, 0, {}, {}, {}, {}, 0, 0};
+const GameSymbols kUnknown{"unknown", {}, 0, {}, {}, {}, {}, {}, 0, 0};
 
 const GameSymbols kVersions[] = {
     /* --- 1.6.10 (2013, armeabi-v7a) ------------------------------------- */
@@ -41,6 +41,13 @@ const GameSymbols kVersions[] = {
         },
         /* jni_native */ {
             0, /* http_transaction_error: 1.6 reaches the menu, left untouched */
+        },
+        /* patch */ {
+            /* Not mapped for 1.6 -- nothing is rewritten, so its store behaves
+             * exactly as it always has. */
+            {0}, /* purchase_online_gate     */
+            0,   /* purchase_local_receipt   */
+            0,   /* purchase_receipt_verdict */
         },
         /* input */ {
             68,  /* driver        */
@@ -97,6 +104,34 @@ const GameSymbols kVersions[] = {
         /* fn */ {0},
         /* jni_native */ {
             0xcded8c, /* HttpTransactionError: enqueues a failure via sub_CB9F80 */
+        },
+        /* patch */ {
+            /* purchase_online_gate -- the four `BL sub_247084` inside the
+             * PurchaseBroker (sub_247084 is "GetNetworkStatus() is 1 or 2").
+             * Every one of them gates a purchase step on connectivity and shows
+             * [PURCHASE_ERROR_SERVICE_UNAVAILABLE_HEADER] when it fails; the
+             * first is the one a player hits by pressing Buy.
+             * The SAME helper is called from a dozen non-store places, which is
+             * exactly why the call sites are patched and not the helper. */
+            {
+                0x72d320, /* in sub_72D264 -- start a single purchase       */
+                0x72dc14, /* in sub_72DB98 -- "is the store offline?"        */
+                0x72e0d8, /* in sub_72E0C0 -- restore purchases              */
+                0x72e38c, /* in sub_72E384 -- any purchase still in flight?  */
+                0,
+            },
+            /* purchase_local_receipt: the `MOV R1,#1` in sub_737DB8, whose only
+             * caller is PurchaseBroker::OnPaymentComplete (sub_72EE30). R1=1
+             * means "POST this receipt to the validation server and wait for
+             * $.validation"; R1=0 takes sub_737DC0's finish-now branch. */
+            0x737db8,
+            /* purchase_receipt_verdict: the `MOV R0,#0` at the head of that
+             * finish-now branch (loc_737EA4), whose STRB writes the record's
+             * "validated" byte before it sets the state to 4=finished. 0 there
+             * is what makes the broker (sub_7305D8) show "Unable to contact
+             * store" instead of delivering; 1 is what sub_738F3C writes when a
+             * real server replies "passed". */
+            0x737ea4,
         },
         /* input */ {},
         0xE59F1010E59F0010ull, /* LDR R0,[PC,#0x10]; LDR R1,[PC,#0x10] */
